@@ -8,8 +8,8 @@ UART adapter, or the ESP Serial Bridge's UDP stream.
 
 Download `SCV2-Dashboard.exe` and `SCV2-Dashboard.exe.sha256` from the latest
 GitHub Release. Verify the checksum, then run the EXE on 64-bit Windows 10 or
-11. It bundles Python, Qt, and pyserial. The unsigned in-house executable may
-show a Windows SmartScreen warning.
+11. It bundles Python, Qt, pyserial, NumPy, and PyQtGraph. The unsigned in-house
+executable may show a Windows SmartScreen warning.
 
 Only one application can own a COM port at a time. Close serial terminals and
 other dashboard instances before connecting.
@@ -43,6 +43,23 @@ Useful options:
 ```
 
 Options preselect the UI controls; they do not automatically connect.
+
+## Live graphs
+
+The Graphs tab uses a 30-second oscilloscope-style sweep in a 2-by-2 layout.
+At the end of each pass, the plotted history is cleared and a new trace begins
+at zero. It redraws only while visible, at no more than 30 Hz, and plots virtual
+CAN/UART energy, capacitor voltage, chassis power, capacitor power, and
+requested power. PyQtGraph clips data outside the visible time range and uses
+peak-preserving automatic downsampling when zoomed out.
+
+The vertical axes are fixed so changing values do not rescale the plots:
+virtual energy is 0 to 70 J, capacitor voltage is 0 to 30 V, chassis power is
+-50 to 400 W, and the combined capacitor/requested-power plot is -260 to 260 W.
+
+Virtual energy is shown only when the active control decision is CAN or UART
+and the corresponding energy value is valid and fresh. An unavailable value
+creates a gap rather than being displayed as zero.
 
 ## Connections
 

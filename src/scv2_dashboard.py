@@ -17,6 +17,8 @@ import threading
 import time
 from dataclasses import dataclass
 
+import numpy as np
+import pyqtgraph as pg
 import serial
 from PySide6 import QtCore, QtGui, QtWidgets
 from serial.tools import list_ports
@@ -93,6 +95,84 @@ for _name in ("can_p_fresh", "can_e_fresh", "can_swen_fresh", "uart_p_fresh", "u
 MODE_REQUEST = ("EXTERNAL", "MANUAL", "MEASURE", "DIRECT GPIO")
 DECISION = ("FAULT DISABLE", "IDLE / UVLO", "NO SOURCE", "MANUAL", "CAN", "UART", "MEASURE", "DIRECT GPIO")
 MODE_OUT = ("BITS 00", "ALGORITHM", "BITS 10", "BITS 11")
+
+GRAPH_SWEEP_SECONDS = 30.0
+GRAPH_HISTORY_SECONDS = GRAPH_SWEEP_SECONDS
+GRAPH_HISTORY_MAX_SAMPLES = 3_600
+GRAPH_REFRESH_HZ = 30.0
+CAN_DECISION = DECISION.index("CAN")
+UART_DECISION = DECISION.index("UART")
+
+
+def graph_values(sample: dict[str, int]) -> tuple[float, float, float, float, float]:
+    """Return energy, Vcap, Pchassis, Pcap, and requested power in display units."""
+    energy = math.nan
+    if (
+        sample["decision"] == CAN_DECISION
+        and sample["can_e_valid"]
+        and sample["can_e_fresh"]
+        and not sample["can_e_disabled"]
+    ):
+        energy = float(sample["can_e"])
+    elif sample["decision"] == UART_DECISION and sample["uart_e_valid"] and sample["uart_e_fresh"]:
+        energy = float(sample["uart_e"])
+
+    vcap = sample["vc_mV"] / 1000.0
+    p_chassis = sample["vb_mV"] * sample["il_mA"] / 1_000_000.0
+    p_cap = sample["vc_mV"] * sample["io_mA"] / 1_000_000.0
+    p_req = float(sample["pset_W"]) - p_chassis
+    return energy, vcap, p_chassis, p_cap, p_req
+
+
+class TelemetryHistory:
+    """Time-bounded NumPy ring buffer used by the graph renderer."""
+
+    SERIES_COUNT = 6  # elapsed time plus the five values returned by graph_values()
+
+    def __init__(self, max_seconds: float, max_samples: int) -> None:
+        self.max_seconds = max_seconds
+        self.max_samples = max_samples
+        self._data = np.empty((self.SERIES_COUNT, max_samples), dtype=np.float64)
+        self._start = 0
+        self._size = 0
+        self._time_origin: float | None = None
+
+    def __len__(self) -> int:
+        return self._size
+
+    def clear(self) -> None:
+        self._start = 0
+        self._size = 0
+        self._time_origin = None
+
+    def append(self, sample: dict[str, int], timestamp: float | None = None) -> None:
+        timestamp = time.monotonic() if timestamp is None else timestamp
+        if self._time_origin is None:
+            self._time_origin = timestamp
+        elapsed = timestamp - self._time_origin
+
+        if self._size < self.max_samples:
+            write_index = (self._start + self._size) % self.max_samples
+            self._size += 1
+        else:
+            write_index = self._start
+            self._start = (self._start + 1) % self.max_samples
+        self._data[:, write_index] = (elapsed, *graph_values(sample))
+
+        cutoff = elapsed - self.max_seconds
+        while self._size and self._data[0, self._start] < cutoff:
+            self._start = (self._start + 1) % self.max_samples
+            self._size -= 1
+
+    def snapshot(self) -> tuple[np.ndarray, ...]:
+        if not self._size:
+            empty = np.empty(0, dtype=np.float64)
+            return tuple(empty for _ in range(self.SERIES_COUNT))
+        end = self._start + self._size
+        if end <= self.max_samples:
+            return tuple(row[self._start:end] for row in self._data)
+        split = end % self.max_samples
+        return tuple(np.concatenate((row[self._start:], row[:split])) for row in self._data)
 
 def parse_t1(line: str) -> dict[str, int] | None:
     """Parse one complete T1 CSV line; unrelated CLI output is ignored."""
@@ -323,6 +403,11 @@ class Dashboard(QtWidgets.QMainWindow):
         self.frame_gaps = 0
         self.status_cards: dict[str, StatusCard] = {}
         self.numeric_cards: dict[str, StatusCard] = {}
+        self.graph_history = TelemetryHistory(GRAPH_HISTORY_SECONDS, GRAPH_HISTORY_MAX_SAMPLES)
+        self.graph_curves: tuple[pg.PlotDataItem, ...] = ()
+        self.graph_plots: tuple[pg.PlotItem, ...] = ()
+        self.graph_sweep_started_at: float | None = None
+        self.graphs_dirty = False
 
         self.setWindowTitle("SCV2 Telemetry Dashboard")
         self.resize(1500, 950)
@@ -334,6 +419,10 @@ class Dashboard(QtWidgets.QMainWindow):
         self.poll_timer.timeout.connect(self.poll_events)
         self.ui_refresh_hz = self.display_refresh_hz()
         self.poll_timer.start(max(1, round(1000 / self.ui_refresh_hz)))
+        self.graph_timer = QtCore.QTimer(self)
+        self.graph_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
+        self.graph_timer.timeout.connect(self.refresh_graphs)
+        self.graph_timer.start(round(1000 / GRAPH_REFRESH_HZ))
         self.demo_timer = QtCore.QTimer(self)
         self.demo_timer.timeout.connect(self.add_demo_sample)
         if args.demo:
@@ -404,8 +493,11 @@ class Dashboard(QtWidgets.QMainWindow):
 
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(self._live_values_page(), "Values")
+        self.graphs_page = self._graphs_page()
+        self.tabs.addTab(self.graphs_page, "Graphs")
         self.tabs.addTab(self._status_page(), "Status")
         self.tabs.addTab(self._command_page(), "USB CLI")
+        self.tabs.currentChanged.connect(self._tab_changed)
         root_layout.addWidget(self.tabs)
         self.update_transport_controls()
 
@@ -463,6 +555,100 @@ class Dashboard(QtWidgets.QMainWindow):
         layout.addWidget(self._value_grid("Capacitor health", ["vcap_max_mV", "cap_bad_windows", "cap_derates", "cap_dE_mJ_min", "cap_dV_mV_min"]), 2, 0)
         layout.addWidget(self._value_grid("Telemetry and diagnostics", ["seq", "adc_hz", "usb_drop", "dma_last", "dma_max", "fault_healthy_ms", "can_tx_enqueue_fail"]), 2, 1)
         return page
+
+    def _graphs_page(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+
+        controls = QtWidgets.QHBoxLayout()
+        sweep_label = QtWidgets.QLabel("30 s oscilloscope sweep — trace clears at the end of each pass")
+        sweep_label.setStyleSheet("font-weight: 700;")
+        clear_button = QtWidgets.QPushButton("Clear history")
+        clear_button.clicked.connect(self.clear_graph_history)
+        self.graph_status = QtWidgets.QLabel("No graph samples")
+        self.graph_status.setStyleSheet("color: #64748b;")
+        controls.addWidget(sweep_label)
+        controls.addWidget(clear_button)
+        controls.addStretch(1)
+        controls.addWidget(self.graph_status)
+        layout.addLayout(controls)
+
+        pg.setConfigOptions(antialias=False)
+        canvas = pg.GraphicsLayoutWidget()
+        layout.addWidget(canvas, 1)
+        specs = (
+            ("Energy Buffer (Virtual)", "J", 0.0, 70.0),
+            ("V_Cap", "V", 0.0, 30.0),
+            ("P_Chassis", "W", -50.0, 400.0),
+            ("P_Cap and P_Req", "W", -260.0, 260.0),
+        )
+        plots: list[pg.PlotItem] = []
+        positions = ((0, 0), (0, 1), (1, 0), (1, 1))
+        for (title, unit, y_min, y_max), (row, column) in zip(specs, positions, strict=True):
+            plot = canvas.addPlot(row=row, col=column, title=title)
+            plot.showGrid(x=True, y=True, alpha=0.2)
+            plot.setLabel("left", unit)
+            plot.setDownsampling(auto=True, mode="peak")
+            plot.setClipToView(True)
+            plot.disableAutoRange(axis=pg.ViewBox.YAxis)
+            plot.setYRange(y_min, y_max, padding=0.0)
+            plot.setMouseEnabled(x=True, y=False)
+            plot.setXRange(0.0, GRAPH_SWEEP_SECONDS, padding=0.0)
+            plot.setLimits(xMin=0.0, xMax=GRAPH_SWEEP_SECONDS, minXRange=0.1, maxXRange=GRAPH_SWEEP_SECONDS)
+            if plots:
+                plot.setXLink(plots[0])
+            plots.append(plot)
+        plots[2].setLabel("bottom", "Sweep time", units="s")
+        plots[3].setLabel("bottom", "Sweep time", units="s")
+        plots[-1].addLegend(offset=(10, 10))
+
+        self.graph_plots = tuple(plots)
+        self.graph_curves = (
+            plots[0].plot(pen=pg.mkPen("#a855f7", width=1), connect="finite"),
+            plots[1].plot(pen=pg.mkPen("#2563eb", width=1), connect="finite"),
+            plots[2].plot(pen=pg.mkPen("#dc2626", width=1), connect="finite"),
+            plots[3].plot(name="P_Cap", pen=pg.mkPen("#16a34a", width=1), connect="finite"),
+            plots[3].plot(name="P_Req", pen=pg.mkPen("#f59e0b", width=1), connect="finite"),
+        )
+        return page
+
+    def _tab_changed(self, _index: int) -> None:
+        if self.tabs.currentWidget() is self.graphs_page:
+            self.refresh_graphs(force=True)
+
+    def clear_graph_history(self) -> None:
+        self.graph_history.clear()
+        self.graph_sweep_started_at = None
+        self.graphs_dirty = True
+        self.refresh_graphs(force=True)
+
+    def record_graph_sample(self, sample: dict[str, int], timestamp: float | None = None) -> None:
+        timestamp = time.monotonic() if timestamp is None else timestamp
+        if self.graph_sweep_started_at is None:
+            self.graph_sweep_started_at = timestamp
+        elif timestamp - self.graph_sweep_started_at >= GRAPH_SWEEP_SECONDS:
+            self.graph_history.clear()
+            self.graph_sweep_started_at = timestamp
+        self.graph_history.append(sample, timestamp)
+        self.graphs_dirty = True
+
+    def refresh_graphs(self, force: bool = False) -> None:
+        if self.tabs.currentWidget() is not self.graphs_page:
+            return
+        if not force and not self.graphs_dirty:
+            return
+
+        elapsed, *series = self.graph_history.snapshot()
+        for curve, values in zip(self.graph_curves, series, strict=True):
+            curve.setData(elapsed, values)
+        self.graphs_dirty = False
+
+        if not elapsed.size:
+            self.graph_status.setText("No graph samples | 30 s sweep | 30 Hz redraw cap")
+            return
+        self.graph_status.setText(
+            f"{elapsed.size:,} samples | sweep {elapsed[-1]:.1f} / {GRAPH_SWEEP_SECONDS:.0f} s | 30 Hz redraw cap"
+        )
 
     def _status_page(self) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
@@ -546,6 +732,7 @@ class Dashboard(QtWidgets.QMainWindow):
         self.listen_started_time = time.monotonic()
         self.last_sender = None
         self.connection_error = None
+        self.clear_graph_history()
         if self.using_udp():
             self.reader = UdpReader(self.udp_port.value(), self.events)
             self.connection.setText(f"Binding UDP :{self.udp_port.value()}…")
@@ -578,6 +765,7 @@ class Dashboard(QtWidgets.QMainWindow):
                 if self.last_seq is not None and data["seq"] > self.last_seq + 1:
                     self.frame_gaps += data["seq"] - self.last_seq - 1
                 self.last_seq = data["seq"]
+                self.record_graph_sample(data)
                 latest_sample = data
             elif event == "packet":
                 sample = self.consume_packet(data, extra[0] if extra else None)
@@ -615,7 +803,7 @@ class Dashboard(QtWidgets.QMainWindow):
                     self.packet_status.setStyleSheet("font-weight: 700; color: #64748b;")
                 self.update_transport_controls()
         if latest_sample is not None:
-            self.consume_sample(latest_sample)
+            self.consume_sample(latest_sample, record_history=False)
         self.update_packet_status()
         self.update_data_rate()
 
@@ -641,7 +829,9 @@ class Dashboard(QtWidgets.QMainWindow):
                     if self.last_seq is not None and sample["seq"] > self.last_seq + 1:
                         self.frame_gaps += sample["seq"] - self.last_seq - 1
                     self.last_seq = sample["seq"]
-                    self.data_sample_times.append(time.monotonic())
+                    sample_time = time.monotonic()
+                    self.data_sample_times.append(sample_time)
+                    self.record_graph_sample(sample, sample_time)
                     latest_sample = sample
             except ValueError as exc:
                 self.connection.setText(f"Ignored malformed telemetry: {exc}")
@@ -674,7 +864,9 @@ class Dashboard(QtWidgets.QMainWindow):
             self.data_sample_times.popleft()
         self.data_rate.setText(f"Data: {len(self.data_sample_times)} Hz")
 
-    def consume_sample(self, sample: dict[str, int]) -> None:
+    def consume_sample(self, sample: dict[str, int], record_history: bool = True) -> None:
+        if record_history:
+            self.record_graph_sample(sample)
         self.last_sample = sample
         for name, card in self.numeric_cards.items():
             if name == "cap_energy_mJ":
@@ -777,6 +969,29 @@ def self_test() -> None:
     assert status_text_and_state("cap_unhealthy", {**parsed, "cap_unhealthy": 1}) == ("UNHEALTHY", "red")
     assert status_text_and_state("can_tx_enqueue_fail", {**parsed, "can_tx_enqueue_fail": 0}) == ("0", "green")
     assert status_text_and_state("can_tx_enqueue_fail", parsed) == ("2", "red")
+    energy, vcap, p_chassis, p_cap, p_req = graph_values(parsed)
+    assert energy == 40.0
+    assert math.isclose(vcap, parsed["vc_mV"] / 1000.0)
+    assert math.isclose(p_chassis, parsed["vb_mV"] * parsed["il_mA"] / 1_000_000.0)
+    assert math.isclose(p_cap, parsed["vc_mV"] * parsed["io_mA"] / 1_000_000.0)
+    assert math.isclose(p_req, parsed["pset_W"] - p_chassis)
+    uart_energy = graph_values({
+        **parsed, "decision": UART_DECISION, "uart_e": 23, "uart_e_valid": 1, "uart_e_fresh": 1,
+    })[0]
+    assert uart_energy == 23.0
+    assert math.isnan(graph_values({**parsed, "decision": CAN_DECISION, "can_e_fresh": 0})[0])
+    assert math.isnan(graph_values({**parsed, "decision": DECISION.index("MANUAL")})[0])
+    history = TelemetryHistory(max_seconds=2.0, max_samples=3)
+    for offset in range(4):
+        history.append({**parsed, "seq": offset}, timestamp=10.0 + offset)
+    history_elapsed, *_history_values = history.snapshot()
+    assert len(history) == 3
+    assert np.array_equal(history_elapsed, np.array([1.0, 2.0, 3.0]))
+    history.append(parsed, timestamp=14.5)
+    history_elapsed, *_history_values = history.snapshot()
+    assert np.array_equal(history_elapsed, np.array([3.0, 4.5]))
+    history.clear()
+    assert len(history) == 0
     stream = NewlineStreamParser()
     assert stream.feed(b"CLI ready\nT1,1") == [b"CLI ready"]
     assert stream.feed(b",2\r\nlast") == [b"T1,1,2\r"]
@@ -789,7 +1004,7 @@ def self_test() -> None:
     command_reader._run_command("status")
     assert fake_serial.writes == [b"telemetry off\r\n", b"status\r\n", b"telemetry on\r\n"]
     assert command_events.get_nowait() == ("command_result", "status", "status output\r\nscv2> ", None)
-    print("T1 parser, UDP stream buffering, USB CLI transaction, and state-display self-test passed.")
+    print("T1 parser, graph calculations/history, UDP buffering, USB CLI, and display self-test passed.")
 
 
 def main() -> int:

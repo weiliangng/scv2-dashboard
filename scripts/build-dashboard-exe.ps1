@@ -21,7 +21,7 @@ if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
     throw "Python environment not found: $pythonPath. Create .venv and install requirements-build.txt."
 }
 
-& $pythonPath -c "import PySide6, serial, PyInstaller"
+& $pythonPath -c "import numpy, pyqtgraph, PySide6, serial, PyInstaller"
 if ($LASTEXITCODE -ne 0) {
     throw "Dashboard build dependencies are missing. Install requirements-build.txt."
 }
@@ -45,8 +45,8 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Copy-Item -LiteralPath (Join-Path $distPath "SCV2-Dashboard.exe") -Destination $outputPath -Force
-& $outputPath --self-test
-if ($LASTEXITCODE -ne 0) {
+$selfTest = Start-Process -FilePath $outputPath -ArgumentList "--self-test" -Wait -PassThru -WindowStyle Hidden
+if ($selfTest.ExitCode -ne 0) {
     throw "The packaged dashboard failed its self-test."
 }
 
