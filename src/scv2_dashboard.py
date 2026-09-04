@@ -403,7 +403,7 @@ class Dashboard(QtWidgets.QMainWindow):
         root_layout.addLayout(controls)
 
         self.tabs = QtWidgets.QTabWidget()
-        self.tabs.addTab(self._live_values_page(), "Live values")
+        self.tabs.addTab(self._live_values_page(), "Values")
         self.tabs.addTab(self._status_page(), "Status")
         self.tabs.addTab(self._command_page(), "USB CLI")
         root_layout.addWidget(self.tabs)
