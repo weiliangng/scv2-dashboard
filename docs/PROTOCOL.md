@@ -4,6 +4,20 @@ The SCV2 firmware remains authoritative for the bytes it emits. This document
 records the contract implemented by this dashboard so compatibility changes can
 be coordinated between repositories.
 
+## Ownership boundary
+
+- The [SCV2 firmware repository](https://github.com/weiliangng/scv2) owns the
+  emitted `T1` schema and semantics, telemetry cadence, USB CLI commands, and
+  physical USART1 interface.
+- The ESP Serial Bridge repository owns its UART-to-UDP forwarding behavior and
+  network configuration.
+- This repository owns record validation and buffering, dashboard calculations
+  and presentation, USB CLI transaction handling, desktop setup, packaging,
+  and dashboard releases.
+
+Firmware- and bridge-controlled values below are recorded as compatibility
+requirements, not redefined by this repository.
+
 ## T1 telemetry
 
 The input is an ASCII, newline-delimited CSV record beginning with `T1`,

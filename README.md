@@ -29,6 +29,9 @@ A conventional Python 3.14 installation also works: create `.venv` with
 `python -m venv .venv`, then install `requirements-build.txt` with the virtual
 environment's `python -m pip`.
 
+See [docs/SETUP.md](docs/SETUP.md) for detailed fresh-PC setup, connection
+behavior, offline installation, packaging, releases, and troubleshooting.
+
 Useful options:
 
 ```text
