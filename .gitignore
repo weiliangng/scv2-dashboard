@@ -1,0 +1,8 @@
+.venv/
+.build/
+release-assets/
+__pycache__/
+*.py[cod]
+*.exe
+*.sha256
+.idea/
