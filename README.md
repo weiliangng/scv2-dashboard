@@ -47,6 +47,14 @@ Useful options:
 
 Options preselect the UI controls; they do not automatically connect.
 
+## HUD
+
+The HUD tab combines a yellow voltage-derived capacitor-energy bar with a
+green/red potential-power overlay, plus an independent measured output-current
+strip. Read-only textboxes show CAN/UART referee inputs, their freshness, and
+the quantities/status flags represented by CAN 0x077. See [docs/HUD.md](docs/HUD.md)
+for the firmware-derived scales and the T1 versus CAN load-power distinction.
+
 ## Live graphs
 
 The Graphs tab uses a 30-second oscilloscope-style sweep in a 2-by-2 layout.

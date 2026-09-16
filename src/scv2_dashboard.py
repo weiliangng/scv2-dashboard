@@ -23,6 +23,8 @@ import serial
 from PySide6 import QtCore, QtGui, QtWidgets
 from serial.tools import list_ports
 
+from hud import HudPage
+
 
 @dataclass(frozen=True)
 class Field:
@@ -493,6 +495,8 @@ class Dashboard(QtWidgets.QMainWindow):
 
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(self._live_values_page(), "Values")
+        self.hud_page = HudPage(demo=self.args.demo)
+        self.tabs.addTab(self.hud_page, "HUD")
         self.graphs_page = self._graphs_page()
         self.tabs.addTab(self.graphs_page, "Graphs")
         self.tabs.addTab(self._status_page(), "Status")
@@ -733,6 +737,7 @@ class Dashboard(QtWidgets.QMainWindow):
         self.last_sender = None
         self.connection_error = None
         self.clear_graph_history()
+        self.hud_page.reset()
         if self.using_udp():
             self.reader = UdpReader(self.udp_port.value(), self.events)
             self.connection.setText(f"Binding UDP :{self.udp_port.value()}…")
@@ -806,6 +811,7 @@ class Dashboard(QtWidgets.QMainWindow):
             self.consume_sample(latest_sample, record_history=False)
         self.update_packet_status()
         self.update_data_rate()
+        self.hud_page.refresh_quality()
 
     def consume_packet(self, raw: bytes, sender: tuple[str, int] | None) -> dict[str, int] | None:
         """Keep incoming datagrams intact, then parse complete stream records from them."""
@@ -868,6 +874,7 @@ class Dashboard(QtWidgets.QMainWindow):
         if record_history:
             self.record_graph_sample(sample)
         self.last_sample = sample
+        self.hud_page.set_sample(sample)
         for name, card in self.numeric_cards.items():
             if name == "cap_energy_mJ":
                 card.set_state(f"{sample[name] / 1000.0:,.3f} J", "blue")
@@ -941,6 +948,23 @@ def enum_text(values: tuple[str, ...], value: int) -> str:
 
 
 def self_test() -> None:
+    from hud import bar_geometry, hud_values
+    from hud_config import HUD_CONFIG
+
+    hud_sample = {**demo_sample(0), "vc_mV": 26300, "vb_mV": 24000,
+                  "il_mA": 10000, "io_mA": -2500}
+    hud = hud_values(hud_sample)
+    assert hud.fraction == 1.0 and hud.potential_w == -160.0 and hud.current_a == -2.5
+    assert math.isclose(hud.energy_j, 1660.056)
+    assert hud_values({**hud_sample, "pset_W": 0}).potential_w == -160.0
+    assert hud_values({**hud_sample, "io_mA": 4000}).potential_w == hud.potential_w
+    assert hud_values({**hud_sample, "can_p_fresh": 0}).potential_w is None
+    geometry = bar_geometry(1000, 1, 50, 15)
+    assert geometry["power_left"] == geometry["tip"]
+    assert geometry["power_left"] + geometry["power_width"] > geometry["origin"] + geometry["span"]
+    assert geometry["current_width"] == geometry["span"] / 2
+    assert HUD_CONFIG.current_full_scale_a == 15
+
     class FakeSerial:
         def __init__(self, chunks: list[bytes]) -> None:
             self.chunks = deque(chunks)
@@ -1004,7 +1028,7 @@ def self_test() -> None:
     command_reader._run_command("status")
     assert fake_serial.writes == [b"telemetry off\r\n", b"status\r\n", b"telemetry on\r\n"]
     assert command_events.get_nowait() == ("command_result", "status", "status output\r\nscv2> ", None)
-    print("T1 parser, graph calculations/history, UDP buffering, USB CLI, and display self-test passed.")
+    print("T1 parser, HUD model/geometry, graph calculations/history, UDP buffering, USB CLI, and display self-test passed.")
 
 
 def main() -> int:

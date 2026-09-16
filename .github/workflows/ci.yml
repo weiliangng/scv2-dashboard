@@ -37,6 +37,8 @@ jobs:
         run: |
           .\.venv\Scripts\python.exe .\src\scv2_dashboard.py --self-test
           $env:QT_QPA_PLATFORM = "offscreen"
+          .\.venv\Scripts\python.exe -m unittest discover -s tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\.venv\Scripts\python.exe .\src\scv2_dashboard.py --demo --exit-after 1
 
       - name: Package and test executable
