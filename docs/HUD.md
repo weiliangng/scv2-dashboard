@@ -24,6 +24,15 @@ The energy scale stays fixed at the nominal window; the runtime charge ceiling
 current remain visible outside the display range. Over-range bars saturate and
 show a diagnostic. Space on both sides preserves the power overlay at 0/100%.
 
+The HUD applies a 20-sample boxcar average to capacitor voltage, calculated
+chassis load, and measured output current. At T1's nominal 100 Hz cadence this
+is a 200 ms averaging window. During startup it averages the samples available
+so far; reconnecting resets the window. Energy is calculated from averaged
+voltage, and potential power uses averaged load. Referee inputs, validity,
+freshness, controller state, and fault flags remain immediate. The Values and
+Graphs tabs retain their existing unaveraged behavior. The sample count is set
+once in `src/hud_config.py` as `average_samples`.
+
 ## Referee power and independent current
 
 Potential power = fresh referee power limit − chassis load. In EXTERNAL mode,

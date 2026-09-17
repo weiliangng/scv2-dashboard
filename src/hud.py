@@ -1,5 +1,6 @@
 """Voltage-derived energy/potential power and independent measured-current HUD."""
 
+from collections import deque
 from dataclasses import dataclass
 import time
 
@@ -21,10 +22,42 @@ class HudValues:
     status: int
 
 
-def hud_values(sample: dict[str, int], cfg: HudConfig = HUD_CONFIG) -> HudValues:
+class HudAverager:
+    """Fixed-count boxcar average for the HUD's three analogue measurements."""
+
+    def __init__(self, sample_count: int) -> None:
+        if not isinstance(sample_count, int) or sample_count <= 0:
+            raise ValueError("sample_count must be a positive integer")
+        self.sample_count = sample_count
+        self.samples: deque[tuple[float, float, float]] = deque()
+        self.sums = [0.0, 0.0, 0.0]
+
+    def reset(self) -> None:
+        self.samples.clear()
+        self.sums[:] = (0.0, 0.0, 0.0)
+
+    def add(self, sample: dict[str, int]) -> tuple[float, float, float]:
+        values = (sample["vc_mV"] / 1000.0,
+                  sample["vb_mV"] * sample["il_mA"] / 1_000_000.0,
+                  sample["io_mA"] / 1000.0)
+        if len(self.samples) == self.sample_count:
+            removed = self.samples.popleft()
+            for index, value in enumerate(removed):
+                self.sums[index] -= value
+        self.samples.append(values)
+        for index, value in enumerate(values):
+            self.sums[index] += value
+        return tuple(total / len(self.samples) for total in self.sums)
+
+
+def hud_values(sample: dict[str, int], cfg: HudConfig = HUD_CONFIG,
+               measurements: tuple[float, float, float] | None = None) -> HudValues:
     """Adapt T1 without claiming it contains the averaged 0x077 load sample."""
-    voltage = sample["vc_mV"] / 1000.0
-    load = sample["vb_mV"] * sample["il_mA"] / 1_000_000.0
+    voltage, load, current = measurements or (
+        sample["vc_mV"] / 1000.0,
+        sample["vb_mV"] * sample["il_mA"] / 1_000_000.0,
+        sample["io_mA"] / 1000.0,
+    )
     energy = min(cfg.capacity_j, max(0.0, 0.5 * cfg.bank_capacitance_f *
                                    (max(0.0, voltage)**2 - cfg.cap_cutoff_v**2)))
     # Follow EXTERNAL source arbitration, even when safety inhibits switching.
@@ -38,7 +71,7 @@ def hud_values(sample: dict[str, int], cfg: HudConfig = HUD_CONFIG) -> HudValues
         budget, source = float(sample["can_p"]), "CAN"
     status = (sample["fault_bits"] & 0x03) | (
         0x04 if sample["can_p_valid"] and sample["can_p_fresh"] else 0)
-    return HudValues(voltage, load, sample["io_mA"] / 1000.0, energy,
+    return HudValues(voltage, load, current, energy,
                      energy / cfg.capacity_j, budget, source,
                      None if budget is None else budget - load, status)
 
@@ -65,10 +98,10 @@ class PowerBars(QtWidgets.QWidget):
         self.cfg = cfg
         self.values: HudValues | None = None
         self.stale = False
-        self.setMinimumHeight(184)
+        self.setMinimumHeight(154)
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
         self.setAccessibleName("Capacitor energy, potential power, and measured converter current bars")
-        self.current_label = QtWidgets.QLabel("Actual converter current: — A", self)
+        self.current_label = QtWidgets.QLabel("Output — A", self)
         self.current_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.current_label.setStyleSheet("font-weight: 600;")
 
@@ -125,7 +158,6 @@ class PowerBars(QtWidgets.QWidget):
         for x, s in ((g["origin"], f"−{c.current_full_scale_a:g} A"), (g["zero"], "0 A"),
                      (g["origin"] + g["span"], f"+{c.current_full_scale_a:g} A")):
             label(x, y + c.current_height + 9, s)
-        label(g["zero"], 158, "← Discharging  ·  Charging →")
         p.end()
 
 
@@ -133,6 +165,8 @@ class HudPage(QtWidgets.QScrollArea):
     def __init__(self, demo: bool = False, cfg: HudConfig = HUD_CONFIG) -> None:
         super().__init__()
         self.cfg, self.demo = cfg, demo
+        self.averager = HudAverager(cfg.average_samples)
+        self.pending_values: HudValues | None = None
         self.received_at: float | None = None
         self.sample: dict[str, int] | None = None
         self.setWidgetResizable(True)
@@ -147,11 +181,11 @@ class HudPage(QtWidgets.QScrollArea):
         layout.addWidget(title)
         self.quality = QtWidgets.QLabel()
         layout.addWidget(self.quality)
-        self.energy = QtWidgets.QLabel("— J / — J · —%")
+        self.energy = QtWidgets.QLabel("— J · —%")
         self.energy.setStyleSheet("font-size: 28px; font-weight: 600;")
         self.potential = QtWidgets.QLabel("Potential unavailable")
         self.potential.setStyleSheet("font-size: 18px;")
-        self.voltage = QtWidgets.QLabel("Waiting for capacitor voltage")
+        self.voltage = QtWidgets.QLabel("— V")
         for widget in (self.energy, self.voltage, self.potential):
             widget.setWordWrap(True)
             layout.addWidget(widget)
@@ -166,7 +200,7 @@ class HudPage(QtWidgets.QScrollArea):
             ("can_p", "CAN power_limit"), ("can_e", "CAN energy_buffer"),
             ("uart_p", "UART power_limit"), ("uart_e", "UART energy_buffer"),
             ("budget", "Potential-power budget"), ("control", "Controller / switching")))
-        self._add_fields(layout, "0x077 telemetry quantities · from T1", (
+        self._add_fields(layout, f"0x077 telemetry quantities · {cfg.average_samples}-sample average", (
             ("load", "Chassis load (Vbus × Iload)"), ("voltage", "Capacitor voltage"),
             ("current", "Measured output current"), ("vbus_ovp", "Vbus OVP latch · bit 0"),
             ("vcap_ovp", "Vcap OVP latch · bit 1"), ("fresh", "CAN command fresh · bit 2"),
@@ -196,31 +230,46 @@ class HudPage(QtWidgets.QScrollArea):
 
     def reset(self) -> None:
         self.sample = None
+        self.averager.reset()
+        self.pending_values = None
         self.received_at = None
         self.bars.values = None
-        self.energy.setText("— J / — J · —%")
-        self.voltage.setText("Waiting for capacitor voltage")
+        self.energy.setText("— J · —%")
+        self.voltage.setText("— V")
         self.potential.setText("Potential unavailable")
-        self.current.setText("Actual converter current: — A")
+        self.current.setText("Output — A")
         self.notes.clear()
         for box in self.boxes.values():
             box.setText("—")
         self.refresh_quality()
 
-    def set_sample(self, sample: dict[str, int], received_at: float | None = None) -> None:
+    def accumulate_sample(self, sample: dict[str, int], received_at: float | None = None) -> None:
+        """Add one valid T1 record without forcing an intermediate widget redraw."""
         self.sample = sample.copy()
         self.received_at = time.monotonic() if received_at is None else received_at
-        v = hud_values(sample, self.cfg)
+        self.pending_values = hud_values(sample, self.cfg, self.averager.add(sample))
+
+    def set_sample(self, sample: dict[str, int], received_at: float | None = None,
+                   already_accumulated: bool = False) -> None:
+        if not already_accumulated:
+            self.accumulate_sample(sample, received_at)
+        elif self.pending_values is None:
+            raise ValueError("No accumulated HUD sample is available")
+        else:
+            self.sample = sample.copy()
+            self.received_at = time.monotonic() if received_at is None else received_at
+        v = self.pending_values
+        assert v is not None
         self.bars.values = v
-        self.energy.setText(f"{v.energy_j:,.0f} J / {self.cfg.capacity_j:,.0f} J · {v.fraction:.1%}")
-        self.voltage.setText(f"{v.voltage_v:.2f} V · voltage-based estimate, {self.cfg.bank_capacitance_f:g} F bank")
-        direction = "charging" if v.current_a > 0 else "discharging" if v.current_a < 0 else "no measured flow"
-        self.current.setText(f"Actual converter current: {abs(v.current_a):.2f} A · {direction}")
+        self.energy.setText(f"{v.energy_j:,.0f} J · {v.fraction:.1%}")
+        self.voltage.setText(f"{v.voltage_v:.2f} V")
+        arrow = "→" if v.current_a > 0 else "←" if v.current_a < 0 else ""
+        self.current.setText(f"Output {abs(v.current_a):.2f} A {arrow}".rstrip())
         if v.potential_w is None:
             self.potential.setText(f"Potential unavailable · {v.budget_source}")
         else:
-            direction = "charging →" if v.potential_w > 0 else "discharging ←" if v.potential_w < 0 else "balanced"
-            self.potential.setText(f"Potential {v.potential_w:+.1f} W · {direction}   |   Load {v.load_w:.1f} W")
+            arrow = "→" if v.potential_w > 0 else "←" if v.potential_w < 0 else ""
+            self.potential.setText(f"{v.potential_w:+.1f} W {arrow}   |   Load {v.load_w:.1f} W")
         notes = []
         if not self.cfg.cap_cutoff_v <= v.voltage_v <= self.cfg.cap_ceiling_v:
             notes.append("Voltage outside nominal energy window; fill clamped")

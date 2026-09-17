@@ -12,6 +12,7 @@ class HudConfig:
     power_full_scale_w: float = 240.0
     current_full_scale_a: float = 15.0  # OUT limit; IN's 10 A is a different port.
     power_overlay_span_ratio: float = 0.30
+    average_samples: int = 20
     stale_after_s: float = 1.0
     energy_height: int = 36
     current_height: int = 10
@@ -28,6 +29,8 @@ class HudConfig:
                 raise ValueError("HUD scales must be finite and positive")
         if not 0 <= self.cap_cutoff_v < self.cap_ceiling_v:
             raise ValueError("Invalid capacitor voltage window")
+        if not isinstance(self.average_samples, int) or self.average_samples <= 0:
+            raise ValueError("HUD average_samples must be a positive integer")
         if self.power_overlay_span_ratio > 1 or not 0 < self.current_height < self.energy_height:
             raise ValueError("Invalid HUD geometry")
 

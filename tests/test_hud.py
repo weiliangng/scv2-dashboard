@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from PySide6 import QtGui, QtWidgets
-from hud import HudPage, bar_geometry, hud_values
+from hud import HudAverager, HudPage, bar_geometry, hud_values
 from hud_config import HUD_CONFIG, HudConfig
 from scv2_dashboard import Dashboard, FIELDS, demo_sample
 
@@ -41,6 +41,25 @@ class HudModelTests(unittest.TestCase):
         self.assertEqual(hud_values(sample(io_mA=4000)).potential_w, v.potential_w)
         self.assertEqual(hud_values(sample(can_p=120)).current_a, v.current_a)
         self.assertEqual(hud_values(sample(swen_out=0)).current_a, -2.5)
+
+    def test_twenty_sample_rolling_average(self):
+        average = HudAverager(20)
+        for index in range(20):
+            values = average.add(sample(vc_mV=10_000 + index * 1_000,
+                                        vb_mV=10_000, il_mA=index * 100,
+                                        io_mA=index * 100))
+        self.assertEqual(len(average.samples), 20)
+        self.assertEqual(values[:2], (19.5, 9.5))
+        self.assertAlmostEqual(values[2], .95)
+        values = average.add(sample(vc_mV=30_000, vb_mV=10_000,
+                                    il_mA=2_000, io_mA=2_000))
+        self.assertEqual(len(average.samples), 20)
+        self.assertEqual(values[:2], (20.5, 10.5))
+        self.assertAlmostEqual(values[2], 1.05)
+        average.reset()
+        self.assertEqual(average.add(sample(vc_mV=26_000, vb_mV=20_000,
+                                            il_mA=5_000, io_mA=-1_000)),
+                         (26.0, 100.0, -1.0))
 
     def test_sources_and_status(self):
         self.assertIsNone(hud_values(sample(can_p_fresh=0)).potential_w)
@@ -73,7 +92,8 @@ class HudModelTests(unittest.TestCase):
 
     def test_config_validation(self):
         for changes in ({"current_full_scale_a": 0}, {"cap_cutoff_v": 30},
-                        {"bank_capacitance_f": math.nan}, {"power_overlay_span_ratio": 2}):
+                        {"bank_capacitance_f": math.nan}, {"power_overlay_span_ratio": 2},
+                        {"average_samples": 0}, {"average_samples": 20.0}):
             with self.assertRaises(ValueError):
                 HudConfig(**changes)
 
@@ -98,8 +118,9 @@ class HudUiTests(unittest.TestCase):
         page.refresh_quality(11)
         self.assertTrue(page.bars.stale)
         self.assertEqual(page.bars.values.current_a, -2.5)
+        page.reset()
         page.set_sample(sample(io_mA=0, swen_out=1))
-        self.assertIn("no measured flow", page.current.text())
+        self.assertEqual(page.current.text(), "Output 0.00 A")
         self.assertIn("ON", page.boxes["control"].text())
         page.resize(750, 1100)
         page.show()
@@ -130,6 +151,22 @@ class HudUiTests(unittest.TestCase):
         window.events.put(("packet", line[100:]))
         window.poll_events()
         self.assertEqual(window.hud_page.bars.values.potential_w, -160)
+        self.assertEqual(window.hud_page.energy.text(), "1,660 J · 100.0%")
+        self.assertEqual(window.hud_page.voltage.text(), "26.30 V")
+        self.assertEqual(window.hud_page.current.text(), "Output 2.50 A ←")
+        self.assertEqual(window.hud_page.potential.text(), "-160.0 W ←   |   Load 240.0 W")
+        window.hud_page.reset()
+        records = []
+        for index in range(20):
+            averaged = sample(seq=index + 1, vc_mV=10_000 + index * 1_000,
+                              vb_mV=10_000, il_mA=index * 100, io_mA=index * 100)
+            records.append("T1," + ",".join(str(averaged[f.name]) for f in FIELDS) + "\r\n")
+        window.events.put(("packet", "".join(records).encode()))
+        window.poll_events()
+        self.assertEqual(len(window.hud_page.averager.samples), 20)
+        self.assertEqual(window.hud_page.bars.values.voltage_v, 19.5)
+        self.assertEqual(window.hud_page.bars.values.load_w, 9.5)
+        self.assertAlmostEqual(window.hud_page.bars.values.current_a, .95)
         timestamp = window.hud_page.received_at
         window.events.put(("packet", b"T1,bad\nCLI ready\n"))
         window.poll_events()
@@ -140,7 +177,6 @@ class HudUiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertFalse(window.grab().isNull())
         window.close()
-
 
 if __name__ == "__main__":
     unittest.main()

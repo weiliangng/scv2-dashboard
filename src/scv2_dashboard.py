@@ -771,6 +771,7 @@ class Dashboard(QtWidgets.QMainWindow):
                     self.frame_gaps += data["seq"] - self.last_seq - 1
                 self.last_seq = data["seq"]
                 self.record_graph_sample(data)
+                self.hud_page.accumulate_sample(data)
                 latest_sample = data
             elif event == "packet":
                 sample = self.consume_packet(data, extra[0] if extra else None)
@@ -808,7 +809,7 @@ class Dashboard(QtWidgets.QMainWindow):
                     self.packet_status.setStyleSheet("font-weight: 700; color: #64748b;")
                 self.update_transport_controls()
         if latest_sample is not None:
-            self.consume_sample(latest_sample, record_history=False)
+            self.consume_sample(latest_sample, record_history=False, hud_already_accumulated=True)
         self.update_packet_status()
         self.update_data_rate()
         self.hud_page.refresh_quality()
@@ -838,6 +839,7 @@ class Dashboard(QtWidgets.QMainWindow):
                     sample_time = time.monotonic()
                     self.data_sample_times.append(sample_time)
                     self.record_graph_sample(sample, sample_time)
+                    self.hud_page.accumulate_sample(sample, sample_time)
                     latest_sample = sample
             except ValueError as exc:
                 self.connection.setText(f"Ignored malformed telemetry: {exc}")
@@ -870,11 +872,12 @@ class Dashboard(QtWidgets.QMainWindow):
             self.data_sample_times.popleft()
         self.data_rate.setText(f"Data: {len(self.data_sample_times)} Hz")
 
-    def consume_sample(self, sample: dict[str, int], record_history: bool = True) -> None:
+    def consume_sample(self, sample: dict[str, int], record_history: bool = True,
+                       hud_already_accumulated: bool = False) -> None:
         if record_history:
             self.record_graph_sample(sample)
         self.last_sample = sample
-        self.hud_page.set_sample(sample)
+        self.hud_page.set_sample(sample, already_accumulated=hud_already_accumulated)
         for name, card in self.numeric_cards.items():
             if name == "cap_energy_mJ":
                 card.set_state(f"{sample[name] / 1000.0:,.3f} J", "blue")
