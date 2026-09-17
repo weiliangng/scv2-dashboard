@@ -106,8 +106,8 @@ CAN_DECISION = DECISION.index("CAN")
 UART_DECISION = DECISION.index("UART")
 
 
-def graph_values(sample: dict[str, int]) -> tuple[float, float, float, float, float]:
-    """Return energy, Vcap, Pchassis, Pcap, and requested power in display units."""
+def graph_values(sample: dict[str, int]) -> tuple[float, float, float, float, float, float]:
+    """Return energy, Vcap, chassis/referee power, capacitor power, and request."""
     energy = math.nan
     if (
         sample["decision"] == CAN_DECISION
@@ -121,15 +121,28 @@ def graph_values(sample: dict[str, int]) -> tuple[float, float, float, float, fl
 
     vcap = sample["vc_mV"] / 1000.0
     p_chassis = sample["vb_mV"] * sample["il_mA"] / 1_000_000.0
+    p_limit = math.nan
+    # This mirrors SCV2's EXTERNAL input priority: fresh UART power and energy
+    # take precedence; otherwise a fresh valid CAN command is used.
+    if (
+        sample["decision"] == UART_DECISION
+        and sample["uart_p_valid"]
+        and sample["uart_p_fresh"]
+        and sample["uart_e_valid"]
+        and sample["uart_e_fresh"]
+    ):
+        p_limit = float(sample["uart_p"])
+    elif sample["decision"] == CAN_DECISION and sample["can_p_valid"] and sample["can_p_fresh"]:
+        p_limit = float(sample["can_p"])
     p_cap = sample["vc_mV"] * sample["io_mA"] / 1_000_000.0
     p_req = float(sample["pset_W"]) - p_chassis
-    return energy, vcap, p_chassis, p_cap, p_req
+    return energy, vcap, p_chassis, p_limit, p_cap, p_req
 
 
 class TelemetryHistory:
     """Time-bounded NumPy ring buffer used by the graph renderer."""
 
-    SERIES_COUNT = 6  # elapsed time plus the five values returned by graph_values()
+    SERIES_COUNT = 7  # elapsed time plus the six values returned by graph_values()
 
     def __init__(self, max_seconds: float, max_samples: int) -> None:
         self.max_seconds = max_seconds
@@ -583,7 +596,7 @@ class Dashboard(QtWidgets.QMainWindow):
         specs = (
             ("Energy Buffer (Virtual)", "J", 0.0, 70.0),
             ("V_Cap", "V", 0.0, 30.0),
-            ("P_Chassis", "W", -50.0, 400.0),
+            ("P_Chassis and P_Limit", "W", -50.0, 400.0),
             ("P_Cap and P_Req", "W", -260.0, 260.0),
         )
         plots: list[pg.PlotItem] = []
@@ -604,13 +617,15 @@ class Dashboard(QtWidgets.QMainWindow):
             plots.append(plot)
         plots[2].setLabel("bottom", "Sweep time", units="s")
         plots[3].setLabel("bottom", "Sweep time", units="s")
+        plots[2].addLegend(offset=(10, 10))
         plots[-1].addLegend(offset=(10, 10))
 
         self.graph_plots = tuple(plots)
         self.graph_curves = (
             plots[0].plot(pen=pg.mkPen("#a855f7", width=1), connect="finite"),
             plots[1].plot(pen=pg.mkPen("#2563eb", width=1), connect="finite"),
-            plots[2].plot(pen=pg.mkPen("#dc2626", width=1), connect="finite"),
+            plots[2].plot(name="P_Chassis", pen=pg.mkPen("#dc2626", width=1), connect="finite"),
+            plots[2].plot(name="P_Limit", pen=pg.mkPen("#2563eb", width=1), connect="finite"),
             plots[3].plot(name="P_Cap", pen=pg.mkPen("#16a34a", width=1), connect="finite"),
             plots[3].plot(name="P_Req", pen=pg.mkPen("#f59e0b", width=1), connect="finite"),
         )
@@ -996,18 +1011,22 @@ def self_test() -> None:
     assert status_text_and_state("cap_unhealthy", {**parsed, "cap_unhealthy": 1}) == ("UNHEALTHY", "red")
     assert status_text_and_state("can_tx_enqueue_fail", {**parsed, "can_tx_enqueue_fail": 0}) == ("0", "green")
     assert status_text_and_state("can_tx_enqueue_fail", parsed) == ("2", "red")
-    energy, vcap, p_chassis, p_cap, p_req = graph_values(parsed)
+    energy, vcap, p_chassis, p_limit, p_cap, p_req = graph_values(parsed)
     assert energy == 40.0
     assert math.isclose(vcap, parsed["vc_mV"] / 1000.0)
     assert math.isclose(p_chassis, parsed["vb_mV"] * parsed["il_mA"] / 1_000_000.0)
+    assert p_limit == parsed["can_p"]
     assert math.isclose(p_cap, parsed["vc_mV"] * parsed["io_mA"] / 1_000_000.0)
     assert math.isclose(p_req, parsed["pset_W"] - p_chassis)
     uart_energy = graph_values({
-        **parsed, "decision": UART_DECISION, "uart_e": 23, "uart_e_valid": 1, "uart_e_fresh": 1,
-    })[0]
-    assert uart_energy == 23.0
+        **parsed, "decision": UART_DECISION, "uart_p": 100, "uart_p_valid": 1,
+        "uart_p_fresh": 1, "uart_e": 23, "uart_e_valid": 1, "uart_e_fresh": 1,
+    })
+    assert uart_energy[0] == 23.0
+    assert uart_energy[3] == 100.0
     assert math.isnan(graph_values({**parsed, "decision": CAN_DECISION, "can_e_fresh": 0})[0])
     assert math.isnan(graph_values({**parsed, "decision": DECISION.index("MANUAL")})[0])
+    assert math.isnan(graph_values({**parsed, "can_p_fresh": 0})[3])
     history = TelemetryHistory(max_seconds=2.0, max_samples=3)
     for offset in range(4):
         history.append({**parsed, "seq": offset}, timestamp=10.0 + offset)

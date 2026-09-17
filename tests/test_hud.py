@@ -155,6 +155,12 @@ class HudUiTests(unittest.TestCase):
         self.assertEqual(window.hud_page.voltage.text(), "26.30 V")
         self.assertEqual(window.hud_page.current.text(), "Output 2.50 A ←")
         self.assertEqual(window.hud_page.potential.text(), "-160.0 W ←   |   Load 240.0 W")
+        window.tabs.setCurrentWidget(window.graphs_page)
+        window.refresh_graphs(force=True)
+        self.assertEqual(len(window.graph_curves), 6)
+        self.assertEqual(window.graph_plots[2].titleLabel.text, "P_Chassis and P_Limit")
+        self.assertAlmostEqual(window.graph_curves[2].yData[-1], 240.0)
+        self.assertAlmostEqual(window.graph_curves[3].yData[-1], 80.0)
         window.hud_page.reset()
         records = []
         for index in range(20):

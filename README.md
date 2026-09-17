@@ -55,18 +55,28 @@ strip. Read-only textboxes show CAN/UART referee inputs, their freshness, and
 the quantities/status flags represented by CAN 0x077. See [docs/HUD.md](docs/HUD.md)
 for the firmware-derived scales and the T1 versus CAN load-power distinction.
 
+The screenshot below uses the built-in demo telemetry; no controller is
+connected.
+
+![HUD tab showing capacitor energy, potential power, measured output current, and referee inputs](docs/images/hud-demo.png)
+
 ## Live graphs
 
 The Graphs tab uses a 30-second oscilloscope-style sweep in a 2-by-2 layout.
 At the end of each pass, the plotted history is cleared and a new trace begins
 at zero. It redraws only while visible, at no more than 30 Hz, and plots virtual
-CAN/UART energy, capacitor voltage, chassis power, capacitor power, and
-requested power. PyQtGraph clips data outside the visible time range and uses
-peak-preserving automatic downsampling when zoomed out.
+CAN/UART energy, capacitor voltage, chassis power, active referee power limit,
+capacitor power, and requested power. `P_Limit` overlays `P_Chassis` only when
+the active UART or CAN command is valid and fresh. PyQtGraph clips data outside
+the visible time range and uses peak-preserving automatic downsampling when
+zoomed out.
+
+![Graphs tab showing the 30-second sweep for virtual energy, capacitor voltage, chassis/referee power, and capacitor/requested power](docs/images/graphs-demo.png)
 
 The vertical axes are fixed so changing values do not rescale the plots:
-virtual energy is 0 to 70 J, capacitor voltage is 0 to 30 V, chassis power is
--50 to 400 W, and the combined capacitor/requested-power plot is -260 to 260 W.
+virtual energy is 0 to 70 J, capacitor voltage is 0 to 30 V, the combined
+chassis/referee-power plot is -50 to 400 W, and the combined
+capacitor/requested-power plot is -260 to 260 W.
 
 Virtual energy is shown only when the active control decision is CAN or UART
 and the corresponding energy value is valid and fresh. An unavailable value
