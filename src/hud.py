@@ -168,6 +168,7 @@ class HudPage(QtWidgets.QScrollArea):
         self.averager = HudAverager(cfg.average_samples)
         self.pending_values: HudValues | None = None
         self.received_at: float | None = None
+        self.wireless = False
         self.sample: dict[str, int] | None = None
         self.setWidgetResizable(True)
         self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
@@ -257,7 +258,8 @@ class HudPage(QtWidgets.QScrollArea):
             raise ValueError("No accumulated HUD sample is available")
         else:
             self.sample = sample.copy()
-            self.received_at = time.monotonic() if received_at is None else received_at
+            if received_at is not None:
+                self.received_at = received_at
         v = self.pending_values
         assert v is not None
         self.bars.values = v
@@ -306,12 +308,13 @@ class HudPage(QtWidgets.QScrollArea):
             self.boxes[key].setText(value)
         self.refresh_quality()
 
-    def refresh_quality(self, now: float | None = None) -> None:
+    def refresh_quality(self, now: float | None = None, link_down: bool = False) -> None:
         now = time.monotonic() if now is None else now
-        stale = self.received_at is not None and now - self.received_at >= self.cfg.stale_after_s
+        stale = link_down or (self.received_at is not None and now - self.received_at >= self.cfg.stale_after_s)
         prefix = "DEMO · simulated T1 · " if self.demo else "T1 telemetry · "
         self.quality.setText(prefix + ("Waiting for valid data" if self.received_at is None else
-                                     "STALE · holding last valid values" if stale else "Live"))
+                                      "STALE · holding last valid values" if stale else
+                                      "Receiving · ESP timing; delivery age unknown" if self.wireless else "Live"))
         self.bars.stale = stale
         for box in self.boxes.values():
             box.setEnabled(not stale)

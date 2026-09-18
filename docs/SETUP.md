@@ -59,8 +59,10 @@ Useful source options include:
 ```text
 --port COM8
 --baud 115200
---transport serial|udp
+--transport serial|udp|tcp
 --udp-port 14551
+--tcp-host 192.168.4.1
+--tcp-port 8881
 --packet-timeout 3.0
 --demo
 --exit-after SECONDS
@@ -97,7 +99,24 @@ before disconnecting.
 The dashboard must not be used to infer the MCU pin, signal voltage, or ground
 connection. Those are hardware/firmware-owned facts.
 
-### ESP Serial Bridge UDP
+### ESP Serial Bridge TCP (100 ms batches)
+
+1. Build/flash the bridge's `SCV2_WIRELESS_TCP` firmware and join its Wi-Fi
+   access point. The older prebuilt UDP firmware does not emit `W1` timestamps.
+2. Select **Wi-Fi TCP (100 ms)**, host `192.168.4.1`, port `8881` (or the
+   configured bridge endpoint).
+3. Select **Connect**. The dashboard automatically reconnects after a dropped
+   connection or the receive timeout. Only one TCP viewer is supported.
+
+Graphs use only ESP capture timestamps, retaining all roughly 10 ms samples
+inside each 100 ms batch. The HUD and cards refresh with the latest batch.
+**ESP: … Hz** shows received sample cadence in ESP time; its tooltip reports
+ESP queue age and drops/errors. The **gaps** indicator uses `T1.seq`.
+
+**Receiving** confirms arriving telemetry, not its absolute age. PC time only
+drives watchdogs. Wireless remains receive-only; USB CLI stays on USB.
+
+### ESP Serial Bridge UDP (legacy firmware)
 
 1. Configure the bridge to forward the required UART stream to this PC.
 2. Select **UDP listener** and the configured local port; the current UART1
@@ -177,6 +196,17 @@ runner, publishes `SCV2-Dashboard.exe`, and publishes its matching checksum.
 - Ensure no other application has bound the port.
 - Check the Windows Firewall network profile.
 - Confirm the bridge and PC are on the intended network.
+
+### TCP reconnects or reports that W1 firmware is required
+
+- Confirm the ESP runs the new timestamped firmware and the dashboard host/port
+  matches it. Raw TCP from the original transparent bridge is not `W1`.
+- Close any other TCP viewer; the bridge accepts one at a time.
+- Confirm the PC is on the ESP access point and check the firewall profile.
+- **ESP: 100 Hz** describes the captured samples, not 100 UI updates per second.
+  Batching normally updates the cards 10 times per second.
+- If gaps increase, inspect the bridge drop/error tooltip. TCP cannot recover
+  UART losses, queue overflows, or discarded data across a reconnect.
 
 ### Install dependencies offline
 

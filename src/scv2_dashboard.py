@@ -24,6 +24,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from serial.tools import list_ports
 
 from hud import HudPage
+from wireless import WirelessRecord, WirelessTimeline
 
 
 @dataclass(frozen=True)
@@ -374,6 +375,76 @@ class UdpReader(threading.Thread):
             self.events.put(("disconnected", f"UDP :{self.port}"))
 
 
+class TcpReader(threading.Thread):
+    """Receive-only W1 stream, reconnecting without joining separate byte streams."""
+
+    def __init__(self, host: str, port: int, events: queue.Queue, idle_timeout: float = 3.0) -> None:
+        super().__init__(name="scv2-tcp-reader", daemon=True)
+        self.host, self.port, self.events = host, port, events
+        self.idle_timeout = idle_timeout
+        self.stop_requested = threading.Event()
+        self._socket: socket.socket | None = None
+
+    def stop(self) -> None:
+        self.stop_requested.set()
+        connection = self._socket
+        if connection is not None:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def _emit(self, message: tuple) -> bool:
+        # A full UI queue must not prevent disconnect/closing the application.
+        while not self.stop_requested.is_set():
+            try:
+                self.events.put(message, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def run(self) -> None:
+        endpoint = f"TCP {self.host}:{self.port}"
+        try:
+            while not self.stop_requested.is_set():
+                try:
+                    with socket.create_connection((self.host, self.port), timeout=1.0) as connection:
+                        self._socket = connection
+                        connection.settimeout(0.2)
+                        self._emit(("tcp_session", endpoint))
+                        last_received = time.monotonic()
+                        while not self.stop_requested.is_set():
+                            try:
+                                raw = connection.recv(16_384)
+                            except TimeoutError:
+                                if time.monotonic() - last_received >= self.idle_timeout:
+                                    raise TimeoutError("No TCP bytes; reconnecting")
+                                continue
+                            if not raw:
+                                raise ConnectionError("Bridge closed the stream")
+                            last_received = time.monotonic()
+                            if not self._emit(("wireless_packet", raw)):
+                                break
+                except OSError as exc:
+                    self._emit(("tcp_retry", f"{endpoint}: {exc}; retrying…"))
+                finally:
+                    self._socket = None
+                self.stop_requested.wait(0.5)
+        finally:
+            # A cancelled, full stream may discard queued input, but its terminal
+            # event must survive so the Disconnect button can return to Connect.
+            while True:
+                try:
+                    self.events.put_nowait(("disconnected", endpoint))
+                    break
+                except queue.Full:
+                    try:
+                        self.events.get_nowait()
+                    except queue.Empty:
+                        pass
+
+
 class StatusCard(QtWidgets.QFrame):
     def __init__(self, title: str) -> None:
         super().__init__()
@@ -401,8 +472,10 @@ class Dashboard(QtWidgets.QMainWindow):
         super().__init__()
         self.args = args
         self.events: queue.Queue = queue.Queue(maxsize=2000)
-        self.reader: SerialReader | UdpReader | None = None
+        self.reader: SerialReader | UdpReader | TcpReader | None = None
         self.stream_parser = NewlineStreamParser()
+        self.wireless_timeline = WirelessTimeline()
+        self.tcp_link_up = False
         self.raw_packets: deque[bytes] = deque(maxlen=200)
         self.raw_messages: deque[bytes] = deque(maxlen=500)
         self.data_sample_times: deque[float] = deque()
@@ -466,7 +539,8 @@ class Dashboard(QtWidgets.QMainWindow):
         self.transport_combo = QtWidgets.QComboBox()
         self.transport_combo.addItem("USB serial", "serial")
         self.transport_combo.addItem("UDP listener", "udp")
-        self.transport_combo.setCurrentIndex(1 if self.args.transport == "udp" else 0)
+        self.transport_combo.addItem("Wi-Fi TCP (100 ms)", "tcp")
+        self.transport_combo.setCurrentIndex(self.transport_combo.findData(self.args.transport))
         self.transport_combo.currentIndexChanged.connect(self.update_transport_controls)
         self.port_combo = QtWidgets.QComboBox()
         self.port_combo.setMinimumWidth(180)
@@ -476,6 +550,12 @@ class Dashboard(QtWidgets.QMainWindow):
         self.udp_port = QtWidgets.QSpinBox()
         self.udp_port.setRange(1, 65_535)
         self.udp_port.setValue(self.args.udp_port)
+        self.tcp_host = QtWidgets.QLineEdit(getattr(self.args, "tcp_host", "192.168.4.1"))
+        self.tcp_host.setPlaceholderText("ESP address")
+        self.tcp_host.setMaximumWidth(160)
+        self.tcp_port = QtWidgets.QSpinBox()
+        self.tcp_port.setRange(1, 65_535)
+        self.tcp_port.setValue(getattr(self.args, "tcp_port", 8881))
         self.refresh_button = QtWidgets.QPushButton("Refresh ports")
         self.refresh_button.clicked.connect(self.refresh_ports)
         self.connect_button = QtWidgets.QPushButton("Connect")
@@ -487,16 +567,23 @@ class Dashboard(QtWidgets.QMainWindow):
         self.packet_status = QtWidgets.QLabel("Not receiving")
         self.packet_status.setStyleSheet("font-weight: 700; color: #64748b;")
         self.data_rate = QtWidgets.QLabel("Data: 0 Hz")
-        self.data_rate.setToolTip("Valid T1 records received during the preceding second.")
+        self.data_rate.setToolTip("TCP: received sample rate over ESP capture time. Serial/UDP: records received in the preceding PC second.")
         self.data_rate.setStyleSheet("font-weight: 700; color: #1d4ed8;")
         controls.addWidget(QtWidgets.QLabel("Source"))
         controls.addWidget(self.transport_combo)
-        controls.addWidget(QtWidgets.QLabel("Port"))
+        self.serial_port_label = QtWidgets.QLabel("Port")
+        controls.addWidget(self.serial_port_label)
         controls.addWidget(self.port_combo)
-        controls.addWidget(QtWidgets.QLabel("Baud"))
+        self.baud_label = QtWidgets.QLabel("Baud")
+        controls.addWidget(self.baud_label)
         controls.addWidget(self.baud)
-        controls.addWidget(QtWidgets.QLabel("UDP port"))
+        self.udp_label = QtWidgets.QLabel("UDP port")
+        controls.addWidget(self.udp_label)
         controls.addWidget(self.udp_port)
+        self.tcp_label = QtWidgets.QLabel("ESP host / port")
+        controls.addWidget(self.tcp_label)
+        controls.addWidget(self.tcp_host)
+        controls.addWidget(self.tcp_port)
         controls.addWidget(self.refresh_button)
         controls.addWidget(self.connect_button)
         controls.addWidget(self.auto_telemetry)
@@ -521,22 +608,35 @@ class Dashboard(QtWidgets.QMainWindow):
     def using_udp(self) -> bool:
         return self.transport_combo.currentData() == "udp"
 
+    def using_tcp(self) -> bool:
+        return self.transport_combo.currentData() == "tcp"
+
     def update_transport_controls(self) -> None:
         udp = self.using_udp()
+        tcp = self.using_tcp()
+        network = udp or tcp
         connected = self.reader is not None
-        self.port_combo.setEnabled(not udp and not connected)
-        self.baud.setEnabled(not udp and not connected)
-        self.refresh_button.setEnabled(not udp and not connected)
-        self.auto_telemetry.setEnabled(not udp and not connected)
+        self.port_combo.setEnabled(not network and not connected)
+        self.baud.setEnabled(not network and not connected)
+        self.refresh_button.setEnabled(not network and not connected)
+        self.auto_telemetry.setEnabled(not network and not connected)
+        for widget in (self.serial_port_label, self.port_combo, self.baud_label, self.baud,
+                       self.refresh_button, self.auto_telemetry):
+            widget.setVisible(not network)
         self.udp_port.setEnabled(udp and not connected)
+        self.udp_label.setVisible(udp)
+        self.udp_port.setVisible(udp)
+        for widget in (self.tcp_label, self.tcp_host, self.tcp_port):
+            widget.setVisible(tcp)
+            widget.setEnabled(not connected)
         self.transport_combo.setEnabled(not connected)
         command_available = self.serial_connected and self.auto_telemetry.isChecked()
         self.command_input.setEnabled(command_available)
         self.command_button.setEnabled(command_available)
         if command_available:
             self.command_hint.setText("Telemetry is paused only while the command runs, then restored automatically.")
-        elif udp:
-            self.command_hint.setText("USB CLI commands are unavailable for the UDP listener.")
+        elif network:
+            self.command_hint.setText("Wireless telemetry is receive-only. Use USB for CLI commands.")
         elif connected:
             self.command_hint.setText("Commands require Enable USB telemetry while connected, selected before connecting.")
         else:
@@ -748,6 +848,10 @@ class Dashboard(QtWidgets.QMainWindow):
             self.command_button.setEnabled(False)
             return
         self.stream_parser = NewlineStreamParser()
+        self.wireless_timeline = WirelessTimeline()
+        self.tcp_link_up = False
+        self.last_seq = None
+        self.frame_gaps = 0
         self.packet_count = 0
         self.data_sample_times.clear()
         self.last_packet_time = None
@@ -756,7 +860,15 @@ class Dashboard(QtWidgets.QMainWindow):
         self.connection_error = None
         self.clear_graph_history()
         self.hud_page.reset()
-        if self.using_udp():
+        self.hud_page.wireless = self.using_tcp()
+        if self.using_tcp():
+            host = self.tcp_host.text().strip()
+            if not host:
+                QtWidgets.QMessageBox.warning(self, "No ESP address", "Enter the ESP bridge address.")
+                return
+            self.reader = TcpReader(host, self.tcp_port.value(), self.events, self.args.packet_timeout)
+            self.connection.setText(f"Connecting to {host}:{self.tcp_port.value()}…")
+        elif self.using_udp():
             self.reader = UdpReader(self.udp_port.value(), self.events)
             self.connection.setText(f"Binding UDP :{self.udp_port.value()}…")
         else:
@@ -791,10 +903,23 @@ class Dashboard(QtWidgets.QMainWindow):
                 self.record_graph_sample(data)
                 self.hud_page.accumulate_sample(data)
                 latest_sample = data
-            elif event == "packet":
-                sample = self.consume_packet(data, extra[0] if extra else None)
+            elif event in ("packet", "wireless_packet"):
+                sample = self.consume_packet(data, extra[0] if extra else None,
+                                             wireless=event == "wireless_packet")
                 if sample is not None:
                     latest_sample = sample
+            elif event == "tcp_session":
+                # Never append the next connection to a truncated previous line.
+                self.stream_parser = NewlineStreamParser()
+                self.tcp_link_up = True
+                self.connection_error = None
+                self.connection.setText(f"Connected: {data}")
+                self.last_packet_time = None
+                self.listen_started_time = time.monotonic()
+                self.update_transport_controls()
+            elif event == "tcp_retry":
+                self.tcp_link_up = False
+                self.connection.setText(data)
             elif event == "connected":
                 self.connection.setText(f"Connected: {data}")
                 self.serial_connected = isinstance(self.reader, SerialReader)
@@ -819,6 +944,7 @@ class Dashboard(QtWidgets.QMainWindow):
             elif event == "disconnected":
                 self.reader = None
                 self.serial_connected = False
+                self.tcp_link_up = False
                 self.connect_button.setEnabled(True)
                 self.connect_button.setText("Connect")
                 if not self.args.demo and self.connection_error is None:
@@ -830,10 +956,11 @@ class Dashboard(QtWidgets.QMainWindow):
             self.consume_sample(latest_sample, record_history=False, hud_already_accumulated=True)
         self.update_packet_status()
         self.update_data_rate()
-        self.hud_page.refresh_quality()
+        self.hud_page.refresh_quality(link_down=not self.args.demo and self.using_tcp() and not self.tcp_link_up)
 
-    def consume_packet(self, raw: bytes, sender: tuple[str, int] | None) -> dict[str, int] | None:
-        """Keep incoming datagrams intact, then parse complete stream records from them."""
+    def consume_packet(self, raw: bytes, sender: tuple[str, int] | None,
+                       wireless: bool = False) -> dict[str, int] | None:
+        """Retain incoming chunks and parse complete records across chunk boundaries."""
         self.raw_packets.append(raw)
         self.packet_count += 1
         self.last_packet_time = time.monotonic()
@@ -849,15 +976,30 @@ class Dashboard(QtWidgets.QMainWindow):
             self.raw_messages.append(raw_record)
             try:
                 # UART data is raw bytes; replacement keeps malformed UTF-8 display-safe.
-                sample = parse_t1(raw_record.decode("utf-8", errors="replace"))
+                line = raw_record.decode("utf-8", errors="replace")
+                envelope = WirelessRecord.parse(line) if wireless else None
+                sample = parse_t1(envelope.telemetry if envelope else line)
                 if sample is not None:
-                    if self.last_seq is not None and sample["seq"] > self.last_seq + 1:
-                        self.frame_gaps += sample["seq"] - self.last_seq - 1
+                    received_at = time.monotonic()  # connection watchdog only for W1
+                    sample_time = received_at
+                    if envelope is not None:
+                        sample_time, rebooted = self.wireless_timeline.append(envelope)
+                        if rebooted:
+                            self.clear_graph_history()
+                            self.hud_page.reset()
+                            self.last_seq = None
+                    if self.last_seq is not None:
+                        delta = (sample["seq"] - self.last_seq) & 0xFFFFFFFF
+                        if 1 < delta < 0x80000000:
+                            self.frame_gaps += delta - 1
+                        elif delta >= 0x80000000:
+                            # SCV2 can reboot independently of the ESP clock.
+                            self.hud_page.reset()
                     self.last_seq = sample["seq"]
-                    sample_time = time.monotonic()
-                    self.data_sample_times.append(sample_time)
+                    if envelope is None:
+                        self.data_sample_times.append(received_at)
                     self.record_graph_sample(sample, sample_time)
-                    self.hud_page.accumulate_sample(sample, sample_time)
+                    self.hud_page.accumulate_sample(sample, received_at)
                     latest_sample = sample
             except ValueError as exc:
                 self.connection.setText(f"Ignored malformed telemetry: {exc}")
@@ -865,6 +1007,10 @@ class Dashboard(QtWidgets.QMainWindow):
 
     def update_packet_status(self) -> None:
         if self.args.demo or self.reader is None:
+            return
+        if self.using_tcp() and not self.tcp_link_up:
+            self.packet_status.setText("TCP reconnecting…")
+            self.packet_status.setStyleSheet("font-weight: 700; color: #b45309;")
             return
         if self.last_packet_time is None:
             waiting = time.monotonic() - (self.listen_started_time or time.monotonic())
@@ -878,12 +1024,21 @@ class Dashboard(QtWidgets.QMainWindow):
                 text, color = f"No packets for {age:.1f} s", "#b91c1c"
             else:
                 source = f" from {self.last_sender[0]}:{self.last_sender[1]}" if self.last_sender else ""
-                text, color = f"Receiving: {self.packet_count} packets{source}", "#15803d"
+                unit = "chunks" if self.using_tcp() else "packets"
+                text, color = f"Receiving: {self.packet_count} {unit}{source}", "#15803d"
         self.packet_status.setText(text)
         self.packet_status.setStyleSheet(f"font-weight: 700; color: {color};")
 
     def update_data_rate(self) -> None:
         if self.args.demo:
+            return
+        if self.using_tcp():
+            timeline = self.wireless_timeline
+            self.data_rate.setText(f"ESP: {timeline.sample_hz:.1f} Hz")
+            self.data_rate.setToolTip(
+                f"Received records per ESP capture second. Last record queued {timeline.queue_age_ms:.1f} ms "
+                f"before batch preparation; ESP drops/errors since boot: {timeline.bridge_drops}. "
+                "Network delivery age is unknown; PC time does not set graph spacing.")
             return
         cutoff = time.monotonic() - 1.0
         while self.data_sample_times and self.data_sample_times[0] < cutoff:
@@ -920,7 +1075,9 @@ class Dashboard(QtWidgets.QMainWindow):
         for name, card in self.status_cards.items():
             text, state = status_text_and_state(name, sample)
             card.set_state(text, state)
-        self.connection.setText(f"Live — gaps: {self.frame_gaps}  |  T1 sequence: {sample['seq']}")
+        if not self.using_tcp() or self.tcp_link_up:
+            label = "Receiving" if self.using_tcp() else "Live"
+            self.connection.setText(f"{label} — gaps: {self.frame_gaps}  |  T1 sequence: {sample['seq']}")
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         if self.reader is not None:
@@ -1045,6 +1202,14 @@ def self_test() -> None:
     assert stream.feed(b"CLI ready\nT1,1") == [b"CLI ready"]
     assert stream.feed(b",2\r\nlast") == [b"T1,1,2\r"]
     assert stream.feed(b" message\n") == [b"last message"]
+    wireless = WirelessTimeline()
+    for i in range(10):
+        captured_us = 5_000_000_000 + i * 10_000
+        envelope = WirelessRecord.parse(f"W1,17,{captured_us},5000100000,0,{line}")
+        stamp, rebooted = wireless.append(envelope)
+        assert parse_t1(envelope.telemetry) == values
+        assert math.isclose(stamp, i / 100) and not rebooted
+    assert wireless.sample_hz == 100
     command_events: queue.Queue = queue.Queue()
     command_reader = SerialReader("COM1", 115200, True, command_events)
     fake_serial = FakeSerial([b"ok\r\nscv2> ", b"status output\r\nscv2> "])
@@ -1053,15 +1218,17 @@ def self_test() -> None:
     command_reader._run_command("status")
     assert fake_serial.writes == [b"telemetry off\r\n", b"status\r\n", b"telemetry on\r\n"]
     assert command_events.get_nowait() == ("command_result", "status", "status output\r\nscv2> ", None)
-    print("T1 parser, HUD model/geometry, graph calculations/history, UDP buffering, USB CLI, and display self-test passed.")
+    print("T1/W1 parsers, ESP timeline, HUD model/geometry, graph history, stream buffering, and USB CLI self-test passed.")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", help="COM port to open, for example COM8")
     parser.add_argument("--baud", type=int, default=115200)
-    parser.add_argument("--transport", choices=("serial", "udp"), default="serial", help="Initial input source")
+    parser.add_argument("--transport", choices=("serial", "udp", "tcp"), default="serial", help="Initial input source")
     parser.add_argument("--udp-port", type=int, default=14551, help="Local UDP port to bind when using the UDP listener")
+    parser.add_argument("--tcp-host", default="192.168.4.1", help="ESP bridge address")
+    parser.add_argument("--tcp-port", type=int, default=8881, help="ESP timestamped UART1 TCP port")
     parser.add_argument("--packet-timeout", type=float, default=3.0, help="Seconds without a packet before showing a timeout")
     parser.add_argument("--demo", action="store_true", help="Show simulated telemetry without hardware")
     parser.add_argument("--exit-after", type=float, help="Close automatically after this many seconds (test helper)")
@@ -1069,6 +1236,8 @@ def main() -> int:
     args = parser.parse_args()
     if not 1 <= args.udp_port <= 65_535:
         parser.error("--udp-port must be between 1 and 65535")
+    if not 1 <= args.tcp_port <= 65_535:
+        parser.error("--tcp-port must be between 1 and 65535")
     if args.packet_timeout <= 0:
         parser.error("--packet-timeout must be positive")
     if args.self_test:

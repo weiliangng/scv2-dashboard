@@ -2,7 +2,8 @@
 
 Desktop telemetry and USB CLI client for the SCV2 supercapacitor controller.
 The application accepts SCV2 `T1` telemetry over USB serial, a receive-only
-UART adapter, or the ESP Serial Bridge's UDP stream.
+UART adapter, or the ESP Serial Bridge's timestamped TCP stream (legacy UDP
+is also supported).
 
 ## Run the released application
 
@@ -37,8 +38,10 @@ Useful options:
 ```text
 --port COM8
 --baud 115200
---transport serial|udp
+--transport serial|udp|tcp
 --udp-port 14551
+--tcp-host 192.168.4.1
+--tcp-port 8881
 --packet-timeout 3.0
 --demo
 --exit-after SECONDS
@@ -89,8 +92,20 @@ creates a gap rather than being displayed as zero.
   USB telemetry enabled, the dashboard sends `telemetry on` while connected.
 - External UART receiver: SCV2 USART1 transmits at 921600 baud, 8-N-1. This is
   receive-only and does not support USB CLI commands.
-- ESP Serial Bridge: listen for raw UART1 bytes on UDP port 14551. The dashboard
-  reconstructs newline-delimited records across arbitrary datagram boundaries.
+- ESP Serial Bridge: select **Wi-Fi TCP (100 ms)** and connect to
+  `192.168.4.1:8881`. Requires the bridge's `SCV2_WIRELESS_TCP` build: it captures
+  each UART1 record with ESP time, then transmits batches every 100 ms. The graph
+  and displayed ESP sample rate use capture timestamps only, preserving the
+  roughly 10 ms spacing and any actual jitter or gaps regardless of PC receipt
+  time. All records enter history and HUD averaging; cards show the latest.
+  TCP automatically reconnects. USB and direct serial still accept plain `T1`.
+- Legacy ESP UDP: select **UDP listener**, port `14551`, for old raw-stream
+  firmware. This mode is not timestamped or retransmitted.
+
+The TCP HUD says **Receiving**, not that buffered data is current. Without clock
+synchronization, absolute delivery age is unknown. PC time is used only for
+wireless connection/receipt timeouts, never to construct the wireless graph.
+Hover over **ESP: … Hz** for the bridge queue age and drop/error counter.
 
 Before hardware testing, a human must confirm the actual pin-to-signal wiring,
 logic voltage, and common ground. Do not infer the physical connection from
