@@ -64,7 +64,7 @@ connected.
 
 The Graphs tab uses a 30-second oscilloscope-style sweep in a 2-by-2 layout.
 At the end of each pass, the plotted history is cleared and a new trace begins
-at zero. It redraws only while visible, at no more than 30 Hz, and plots virtual
+at zero. It redraws only while visible, at no more than 15 Hz, and plots virtual
 CAN/UART energy, capacitor voltage, chassis power, active referee power limit,
 capacitor power, and requested power. `P_Limit` overlays `P_Chassis` only when
 the active UART or CAN command is valid and fresh. PyQtGraph clips data outside

@@ -101,7 +101,7 @@ MODE_OUT = ("BITS 00", "ALGORITHM", "BITS 10", "BITS 11")
 GRAPH_SWEEP_SECONDS = 30.0
 GRAPH_HISTORY_SECONDS = GRAPH_SWEEP_SECONDS
 GRAPH_HISTORY_MAX_SAMPLES = 3_600
-GRAPH_REFRESH_HZ = 30.0
+GRAPH_REFRESH_HZ = 15.0
 CAN_DECISION = DECISION.index("CAN")
 UART_DECISION = DECISION.index("UART")
 
@@ -663,10 +663,13 @@ class Dashboard(QtWidgets.QMainWindow):
         self.graphs_dirty = False
 
         if not elapsed.size:
-            self.graph_status.setText("No graph samples | 30 s sweep | 30 Hz redraw cap")
+            self.graph_status.setText(
+                f"No graph samples | 30 s sweep | {GRAPH_REFRESH_HZ:.0f} Hz redraw cap"
+            )
             return
         self.graph_status.setText(
-            f"{elapsed.size:,} samples | sweep {elapsed[-1]:.1f} / {GRAPH_SWEEP_SECONDS:.0f} s | 30 Hz redraw cap"
+            f"{elapsed.size:,} samples | sweep {elapsed[-1]:.1f} / {GRAPH_SWEEP_SECONDS:.0f} s | "
+            f"{GRAPH_REFRESH_HZ:.0f} Hz redraw cap"
         )
 
     def _status_page(self) -> QtWidgets.QWidget:
